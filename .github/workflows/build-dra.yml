@@ -1,0 +1,117 @@
+name: Build HiSilicon FFmpeg with DRA
+
+# Builds the ARM64 FFmpeg payload with the native DRA audio decoder.
+#
+# The DRA decoder is now part of this repository's FFmpeg source tree
+# (libavcodec/dradec.c, libavcodec/dradec.h, libavcodec/libdradec.c,
+# libavcodec/codec_id.h, libavcodec/allcodecs.c, libavformat/mpegts.c), so no
+# out-of-tree patch is applied any more. The only out-of-repo tweak is enabling
+# "dra" in HiSilicon-Development/manifest's scripts/ffmpeg.py decoder feature
+# list, done inline below; submit that enabling upstream separately.
+#
+# NOTE: this repo's .gitignore contains "/.*/" (only .forgejo/ is exempted),
+# so stage this file explicitly with:
+#     git add -f .github/workflows/build-dra.yml
+
+on:
+  push:
+    branches: [9.0.1]
+    paths:
+      - 'libavcodec/**'
+      - 'libavformat/**'
+      - '.github/workflows/build-dra.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dra-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    # ffmpeg.py enforces GLIBC <= 2.36 and needs Debian multiarch arm64 packages.
+    container:
+      image: debian:12
+      options: --user root
+    steps:
+      - name: Bootstrap container
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates curl python3 rsync
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory '*'
+          # In container jobs the github.workspace context is the HOST path
+          # (/home/runner/work/...); the container sees /__w/... instead.
+          # Derive every local path from the runtime GITHUB_WORKSPACE variable.
+          echo "WS=$GITHUB_WORKSPACE/dvbip" >> "$GITHUB_ENV"
+
+      - name: Install repo tool
+        run: |
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          chmod 0755 /usr/local/bin/repo
+          repo --version
+
+      - name: Checkout FFmpeg-hiSilicon
+        uses: actions/checkout@v4
+        with:
+          path: src
+          fetch-depth: 1
+
+      - name: Sync HiSilicon-Development manifest workspace
+        run: |
+          mkdir -p "$WS"
+          cd "$WS"
+          repo init --depth=1 -u https://github.com/HiSilicon-Development/manifest.git -b main
+          repo sync -c -j4 --no-clone-bundle
+          test -f "$WS/build.sh"
+          test -f "$WS/kernel/Makefile"
+          test -f "$WS/scripts/ffmpeg.py"
+
+      - name: Install cross-build dependencies
+        # install-deps.sh targets an interactive build host and calls
+        # "apt-get install" without -y; let apt assume yes in CI instead of
+        # editing the manifest script.
+        run: |
+          printf 'APT::Get::Assume-Yes "true";\nDpkg::Use-Pty "0";\n' \
+            > /etc/apt/apt.conf.d/99ci-noninteractive
+          DEBIAN_FRONTEND=noninteractive bash "$WS/scripts/install-deps.sh"
+
+      - name: Use this repository as FFmpeg source and enable DRA in manifest
+        run: |
+          rm -rf "$WS/ffmpeg"
+          cp -a "$GITHUB_WORKSPACE/src" "$WS/ffmpeg"
+          # The DRA decoder already lives in the FFmpeg source tree; just enable
+          # it in the manifest's ffmpeg.py decoder feature list (was previously
+          # a patch under patches/manifest/).
+          sed -i 's/mjpeg,mjpeg_v4l2m2m/mjpeg,mjpeg_v4l2m2m,dra/' "$WS/scripts/ffmpeg.py"
+          test -f "$WS/ffmpeg/libavcodec/dradec.c"
+          grep -q 'extern const FFCodec ff_dra_decoder;' "$WS/ffmpeg/libavcodec/allcodecs.c"
+          grep -q ',dra"' "$WS/scripts/ffmpeg.py"
+
+      - name: Build ARM64 FFmpeg payload
+        run: |
+          cd "$WS"
+          ./build.sh --target ffmpeg --jobs 4
+          grep -q '#define CONFIG_DRA_DECODER 1' "$WS/out/ffmpeg/metadata/config_components.h"
+          # Device baseline configuration plus ",dra" and nothing else.
+          grep -q "mjpeg_v4l2m2m,dra'" "$WS/out/ffmpeg/metadata/CONFIGURATION.txt"
+
+      - name: Package build output
+        run: |
+          cd "$WS/out/ffmpeg"
+          tar -czf hivxe-ffmpeg-dra-aarch64.tar.gz \
+            payload metadata licenses SHA256SUMS
+          ls -lh hivxe-ffmpeg-dra-aarch64.tar.gz
+
+      - name: Upload FFmpeg build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hivxe-ffmpeg-dra-aarch64
+          path: dvbip/out/ffmpeg/hivxe-ffmpeg-dra-aarch64.tar.gz
+          if-no-files-found: error
+          retention-days: 30
